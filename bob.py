@@ -4,15 +4,25 @@
   python3 bob.py --port 5555
   python3 bob.py --port 5555 --fault prime        # Protocol IV-I  (send non-prime p)
   python3 bob.py --port 5555 --fault generator    # Protocol IV-II (send non-generator g)
+  python3 bob.py --port 5555 --log bob.log        # also write the console output to a file
 
 Bob looks at the first request ({"opcode":0,"type":...}) and runs the matching protocol.
+Anything malformed or invalid coming from the peer is answered with {"opcode":3,"error":...}.
 """
 import argparse
+import random
 import sys
 
 import common as C
 
 ME = "Bob"
+
+
+def abort(st, reason):
+    """Tell the peer why we stop, print it, and return the exit code."""
+    C.send(st, ME, {"opcode": 3, "error": reason})
+    print("[Bob] ERROR: %s -- quitting" % reason)
+    return 1
 
 
 # ----------------------------------------------------------------- Protocol I
@@ -21,6 +31,7 @@ def protocol_rsakey(st, args):
     print("[Bob] generated RSA keypair: p=%d q=%d n=%d e=%d d=%d" % (p, q, n, e, d))
     C.send(st, ME, {"opcode": 0, "type": "RSAKey", "private": d, "public": e,
                     "parameter": {"p": p, "q": q}})
+    return 0
 
 
 # ---------------------------------------------------------------- Protocol II
@@ -30,19 +41,25 @@ def protocol_rsa(st, args):
     C.send(st, ME, {"opcode": 1, "type": "RSA", "public": e, "parameter": {"n": n}})
 
     m = C.expect(C.recv(st, ME), 2, "RSA")
-    enc = m["encrypted_key"]
-    if len(enc) != 32:
-        raise ValueError("encrypted_key must have 32 elements, got %d" % len(enc))
-    key = C.rsa_decrypt_bytes(enc, d, n)
+    try:
+        enc = C.get_encrypted_key(m)
+    except (KeyError, ValueError) as err:
+        return abort(st, "invalid encrypted key: %s" % err)
+    if len(enc) != C.AES_KEY_LEN:
+        return abort(st, "encrypted key must have %d elements, got %d" % (C.AES_KEY_LEN, len(enc)))
+    try:
+        key = C.rsa_decrypt_bytes(enc, d, n)
+    except ValueError:
+        return abort(st, "encrypted key does not decrypt to bytes (wrong public key?)")
     print("[Bob] decrypted symmetric key (hex): %s" % key.hex())
-    secure_chat(st, key, args)
+    return secure_chat(st, key, args)
 
 
 # --------------------------------------------------------- Protocol III / IV
 def protocol_dh(st, args):
     if args.fault == "prime":
         p = C.dh_bad_prime()
-        g = C.random.randrange(2, p - 1)
+        g = random.randrange(2, p - 1)
         print("[Bob] FAULT INJECTION: non-prime p = %d" % p)
     else:
         p, g = C.dh_generate_params()
@@ -55,11 +72,29 @@ def protocol_dh(st, args):
                     "parameter": {"p": p, "g": g}})
 
     m = C.expect(C.recv(st, ME), 1, "DH")               # PeerError if Alice rejects
-    A = C.decode_public(m["public"])
+
+    # Protocol IV from the server side: if the peer sends its own (p, g),
+    # they must pass the same primality / generator checks Alice performs.
+    if isinstance(m.get("parameter"), dict):
+        peer_p, peer_g = m["parameter"].get("p"), m["parameter"].get("g")
+        print("[Bob] peer also sent DH parameters: p=%s g=%s" % (peer_p, peer_g))
+        err = C.dh_param_error(peer_p, peer_g)
+        if err:
+            return abort(st, err)
+        if (peer_p, peer_g) != (p, g):
+            return abort(st, "DH parameters do not match the ones we sent")
+        print("[Bob] peer parameters verified: OK")
+
+    try:
+        A = C.decode_public(m["public"])
+    except (KeyError, ValueError, TypeError):
+        return abort(st, "invalid public key")
+    if not C.dh_public_ok(A, p):
+        return abort(st, "invalid public key")
     shared = pow(A, b, p)
     key = C.dh_aes_key(shared)
     print("[Bob] shared secret = %d, AES key = %s" % (shared, key.hex()))
-    secure_chat(st, key, args)
+    return secure_chat(st, key, args)
 
 
 def secure_chat(st, key, args):
@@ -67,17 +102,23 @@ def secure_chat(st, key, args):
     text = C.get_message(args.message, "hello", ME)
     C.send(st, ME, {"opcode": 2, "type": "AES", "encryption": C.aes_encrypt_b64(key, text)})
     m = C.expect(C.recv(st, ME), 2, "AES")
-    print("[Bob] decrypted message from Alice: %s" % C.aes_decrypt_b64(key, m["encryption"]))
+    try:
+        plain = C.aes_decrypt_b64(key, m["encryption"])
+    except (KeyError, ValueError, UnicodeDecodeError):
+        return abort(st, "AES decryption failed (key mismatch?)")
+    print("[Bob] decrypted message from Alice: %s" % plain)
+    return 0
 
 
 def serve(st, args):
     req = C.expect(C.recv(st, ME), 0)
     handler = {"RSAKey": protocol_rsakey, "RSA": protocol_rsa, "DH": protocol_dh}.get(req.get("type"))
     if handler is None:
-        C.send(st, ME, {"opcode": 3, "error": "unknown type"})
-        return 1
-    handler(st, args)
-    return 0
+        return abort(st, "unknown type")
+    try:
+        return handler(st, args)
+    except (ValueError, KeyError) as e:                  # malformed JSON fields etc.
+        return abort(st, "malformed message: %s" % e)
 
 
 def main():
@@ -90,10 +131,11 @@ def main():
     ap.add_argument("--pubfmt", choices=["int", "base64"], default="int",
                     help="encoding of the DH public key we send (default int, as in the professor's logs)")
     ap.add_argument("--timeout", type=float, default=30, help="seconds to wait for the peer (0 = forever)")
-    ap.add_argument("-l", "--log", help="accepted for compatibility with the skeleton (ignored)")
+    ap.add_argument("-l", "--log", help="also write the console output to this file")
     ap.add_argument("--connect", action="store_true", help="act as the TCP client instead")
     ap.add_argument("--forever", action="store_true", help="keep serving new connections")
     args = ap.parse_args()
+    C.setup_log(args.log)
 
     rc = 0
     while True:

@@ -54,16 +54,17 @@ def protocol_dh(st, args):
     m = C.expect(C.recv(st, ME), 1, "DH")
     p, g = m["parameter"]["p"], m["parameter"]["g"]
     B = C.decode_public(m["public"])
-    print("\n[Alice] received DH parameters: p = %d, g = %d, B = %d" % (p, g, B))
+    print("\n[Alice] received DH parameters: p = %s, g = %s, B = %d" % (p, g, B))
 
     # Protocol IV-I: primality test (and allowed range) on p
-    if not (C.P_MIN <= p <= C.P_MAX and C.is_prime(p)):
-        return abort(st, "incorrect prime number")
-    print("[Alice] p is prime: OK")
     # Protocol IV-II: g must be a generator of Z_p^*
-    if not C.is_generator(g, p):
-        return abort(st, "incorrect generator")
+    err = C.dh_param_error(p, g)
+    if err:
+        return abort(st, err)
+    print("[Alice] p is prime: OK")
     print("[Alice] g is a generator: OK")
+    if not C.dh_public_ok(B, p):
+        return abort(st, "invalid public key")
 
     a, A = C.dh_keypair(p, g)
     # "auto": answer in the same format the peer used for its public key
@@ -88,10 +89,11 @@ def abort(st, reason):
 def secure_chat(st, key, args, first):
     """Bob speaks first; Alice decrypts, prints, then answers."""
     m = C.expect(C.recv(st, ME), 2, "AES")
-    print(
-        "[Alice] decrypted message from Bob: %s"
-        % C.aes_decrypt_b64(key, m["encryption"])
-    )
+    try:
+        plain = C.aes_decrypt_b64(key, m["encryption"])
+    except (KeyError, ValueError, UnicodeDecodeError):
+        return abort(st, "AES decryption failed (key mismatch?)")
+    print("[Alice] decrypted message from Bob: %s" % plain)
     text = C.get_message(args.message, "world", ME)
     C.send(
         st, ME, {"opcode": 2, "type": "AES", "encryption": C.aes_encrypt_b64(key, text)}
@@ -117,13 +119,12 @@ def main():
         default=30,
         help="seconds to wait for the peer (0 = forever)",
     )
-    ap.add_argument(
-        "-l", "--log", help="accepted for compatibility with the skeleton (ignored)"
-    )
+    ap.add_argument("-l", "--log", help="also write the console output to this file")
     ap.add_argument(
         "--listen", action="store_true", help="act as the TCP server instead"
     )
     args = ap.parse_args()
+    C.setup_log(args.log)
 
     st = C.open_stream(args.addr, args.port, args.listen, "Bob", args.timeout)
     try:

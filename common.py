@@ -10,6 +10,34 @@ import sys
 import aes_ecb
 
 P_MIN, P_MAX = 400, 500          # allowed range for the primes
+AES_KEY_LEN = 32                 # AES-256 key size in bytes
+
+# ------------------------------------------------------------------ logging
+class _Tee:
+    """Writes to several streams at once (console + log file)."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            st.write(s)
+
+    def flush(self):
+        for st in self.streams:
+            st.flush()
+
+    def isatty(self):
+        return self.streams[0].isatty()
+
+
+def setup_log(path):
+    """Mirror everything printed to stdout into `path` (-l/--log)."""
+    if not path:
+        return
+    f = open(path, "a", encoding="utf-8")
+    sys.stdout = _Tee(sys.stdout, f)
+
 
 # ------------------------------------------------------------------ JSON net
 class MessageStream:
@@ -229,6 +257,32 @@ def dh_aes_key(shared):
     return shared.to_bytes(2, byteorder="big") * 16
 
 
+def dh_param_error(p, g):
+    """Protocol IV checks on received DH parameters -> error string or None."""
+    if not isinstance(p, int) or not isinstance(g, int):
+        return "incorrect prime number"
+    if not (P_MIN <= p <= P_MAX and is_prime(p)):
+        return "incorrect prime number"
+    if not is_generator(g, p):
+        return "incorrect generator"
+    return None
+
+
+def dh_public_ok(x, p):
+    """A DH public key must be an element of Z_p^* (0 < x < p)."""
+    return isinstance(x, int) and 0 < x < p
+
+
+def discrete_log(g, h, p):
+    """Smallest x with g^x == h (mod p). p <= 500, so brute force is instant."""
+    cur = 1
+    for x in range(p):
+        if cur == h:
+            return x
+        cur = cur * g % p
+    raise ValueError("no discrete log of %d base %d mod %d" % (h, g, p))
+
+
 # ---------------------------------------------------------------- encodings
 def encode_public(value, fmt):
     """fmt 'int' -> integer, 'base64' -> base64 of the big-endian bytes."""
@@ -242,6 +296,54 @@ def decode_public(value):
     if isinstance(value, int):
         return value
     return int.from_bytes(base64.b64decode(value), "big")
+
+
+def _decode_cipher_element(v):
+    """One RSA ciphertext: int, decimal string or base64 big-endian string."""
+    if isinstance(v, bool):
+        raise ValueError("bad ciphertext element %r" % (v,))
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        if v.strip().lstrip("-").isdigit():
+            return int(v)
+        return int.from_bytes(base64.b64decode(v), "big")
+    raise ValueError("bad ciphertext element %r" % (v,))
+
+
+def decode_encrypted_key(value):
+    """Return the RSA-encrypted AES key as a list of ints.
+
+    The spec says `encrypted_key` is a JSON list of 32 integers, but the slides
+    also draw it as a base64 string under `encryption`, so accept all of:
+      * list of ints                              [189924, 237239, ...]
+      * list of decimal / base64 strings          ["189924", ...] / ["Ag4=", ...]
+      * base64 string containing a JSON list      "WzE4OTkyNCwgMj..."
+      * base64 string of 32 fixed-width big-endian integers
+    """
+    if isinstance(value, list):
+        return [_decode_cipher_element(v) for v in value]
+    if isinstance(value, str):
+        raw = base64.b64decode(value)
+        try:
+            parsed = json.loads(raw.decode())
+            if isinstance(parsed, list):
+                return decode_encrypted_key(parsed)
+        except (ValueError, UnicodeDecodeError):
+            pass
+        if not raw or len(raw) % AES_KEY_LEN:
+            raise ValueError("cannot split %d bytes into %d ciphertexts" % (len(raw), AES_KEY_LEN))
+        width = len(raw) // AES_KEY_LEN
+        return [int.from_bytes(raw[i:i + width], "big") for i in range(0, len(raw), width)]
+    raise ValueError("encrypted key must be a list or a base64 string")
+
+
+def get_encrypted_key(msg):
+    """Pull the RSA-encrypted key out of an opcode-2/RSA message (any field name)."""
+    for field in ("encrypted_key", "encryption", "key"):
+        if field in msg:
+            return decode_encrypted_key(msg[field])
+    raise KeyError("encrypted_key")
 
 
 def aes_encrypt_b64(key, text):
